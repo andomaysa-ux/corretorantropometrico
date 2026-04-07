@@ -3908,7 +3908,7 @@ function computeOtsuThreshold(data){
 }
 
 function preprocessImage(sourceCanvas, options={}){
-  const { contrast=1.8, binary=false, thresholdBias=0, thicken=false } = options;
+  const { contrast=1.8, binary=false, thresholdBias=0, thicken=false, gamma=1 } = options;
   const width=sourceCanvas.width;
   const height=sourceCanvas.height;
   const canvas=document.createElement('canvas');
@@ -3920,9 +3920,17 @@ function preprocessImage(sourceCanvas, options={}){
   const imageData=ctx.getImageData(0,0,width,height);
   const data=imageData.data;
 
+  // Pré-computa tabela de gamma para performance
+  const gammaLUT = new Uint8Array(256);
+  for(let v=0;v<256;v++){
+    gammaLUT[v] = gamma===1 ? v : clamp(Math.round(Math.pow(v/255,gamma)*255),0,255);
+  }
+
   for(let i=0;i<data.length;i+=4){
-    const gray=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
-    const contrasted=clamp(((gray-128)*contrast)+128,0,255);
+    // Grayscale -> gamma -> contrast
+    const raw=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
+    const g=gammaLUT[clamp(Math.round(raw),0,255)];
+    const contrasted=clamp(((g-128)*contrast)+128,0,255);
     data[i]=data[i+1]=data[i+2]=contrasted;
   }
 
@@ -4225,11 +4233,65 @@ function buildFallbackFieldWindows(sourceCanvas){
   return windows;
 }
 
+// Adiciona borda branca ao redor do canvas — Tesseract reconhece melhor com margem
+function addPaddingToCanvas(canvas, pad){
+  pad = pad || 28;
+  const out = document.createElement('canvas');
+  out.width = canvas.width + pad*2;
+  out.height = canvas.height + pad*2;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,out.width,out.height);
+  ctx.drawImage(canvas, pad, pad);
+  return out;
+}
+
+// Escala o canvas — SOMENTE pela altura, com teto de largura para não gerar imagem enorme
+function upscaleCanvas(canvas, targetH, maxW){
+  maxW = maxW || 720;
+  // Fator baseado em altura
+  let factor = canvas.height < targetH ? targetH / canvas.height : 1;
+  // Se a largura resultante ultrapassar maxW, reduz o fator
+  if(canvas.width * factor > maxW) factor = maxW / canvas.width;
+  // Nunca encolher
+  factor = Math.max(1, factor);
+  if(factor <= 1.01) return canvas;
+  const out = document.createElement('canvas');
+  out.width  = Math.round(canvas.width  * factor);
+  out.height = Math.round(canvas.height * factor);
+  const ctx = out.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(canvas, 0, 0, out.width, out.height);
+  return out;
+}
+
 function buildCellVariants(cellCanvas){
+  // Amplia APENAS se a altura for pequena demais para o Tesseract; limita largura a 720px
+  const TARGET_H = 68;
+  const MAX_W    = 720;
+  const scaled = upscaleCanvas(cellCanvas, TARGET_H, MAX_W);
+  const PAD = 14;
+  const prep = (opts) => addPaddingToCanvas(preprocessImage(scaled, opts), PAD);
+
   return [
-    { name:'suave',   psm:7,  canvas: preprocessImage(cellCanvas,{ contrast:2.2,  binary:false, thresholdBias:0,   thicken:false }) },
-    { name:'lapis',   psm:7,  canvas: preprocessImage(cellCanvas,{ contrast:2.75, binary:true,  thresholdBias:-36, thicken:true  }) },
-    { name:'caneta',  psm:13, canvas: preprocessImage(cellCanvas,{ contrast:2.35, binary:true,  thresholdBias:-18, thicken:false }) },
+    // ── CANETA (tinta azul/preta) ───────────────────────────────────────────
+    // Sem binarização — preserva gradiente de tinta
+    { name:'caneta_suave',   psm:7,  canvas: prep({ contrast:2.3, binary:false }) },
+    // Binarização padrão
+    { name:'caneta_bin',     psm:7,  canvas: prep({ contrast:2.5, binary:true,  thresholdBias:-18, thicken:false }) },
+    // Mais agressivo: threshold baixo para tinta fina
+    { name:'caneta_forte',   psm:13, canvas: prep({ contrast:3.0, binary:true,  thresholdBias:-24, thicken:false }) },
+
+    // ── LÁPIS (cinza claro — gamma > 1 escurece o traço antes de binarizar) ─
+    // gamma 2.2: pixel 180 → 107 (muito mais visível para o threshold)
+    { name:'lapis_gamma22',  psm:7,  canvas: prep({ contrast:1.0, gamma:2.2, binary:true, thresholdBias:-36, thicken:true }) },
+    // gamma 3.0: lápis ainda mais claro
+    { name:'lapis_gamma30',  psm:7,  canvas: prep({ contrast:1.0, gamma:3.0, binary:true, thresholdBias:-48, thicken:true }) },
+    // Fallback: alto contraste sem gamma
+    { name:'lapis_forte',    psm:7,  canvas: prep({ contrast:4.2, binary:true, thresholdBias:-55, thicken:true }) },
+    // Extremo: lápis 4H / quase apagado
+    { name:'lapis_extremo',  psm:13, canvas: prep({ contrast:1.0, gamma:4.0, binary:true, thresholdBias:-62, thicken:true }) },
   ];
 }
 
