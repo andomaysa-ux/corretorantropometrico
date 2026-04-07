@@ -3697,81 +3697,428 @@ async function startCamera(){
     document.getElementById('ocr-status').textContent='❌ Erro ao acessar câmera: '+e.message;
   }
 }
-// Pre-process image for better OCR: grayscale, contrast boost, binarization
-function preprocessImage(sourceCanvas){
-  const w=sourceCanvas.width, h=sourceCanvas.height;
-  const proc=document.createElement('canvas');
-  proc.width=w; proc.height=h;
-  const ctx=proc.getContext('2d');
-  ctx.drawImage(sourceCanvas,0,0);
-  const imgData=ctx.getImageData(0,0,w,h);
-  const d=imgData.data;
-  // 1) Grayscale
-  for(let i=0;i<d.length;i+=4){
-    const g=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2];
-    d[i]=d[i+1]=d[i+2]=g;
-  }
-  // 2) Contrast stretch (auto-levels)
-  let mn=255,mx=0;
-  for(let i=0;i<d.length;i+=4){mn=Math.min(mn,d[i]);mx=Math.max(mx,d[i]);}
-  const range=mx-mn||1;
-  for(let i=0;i<d.length;i+=4){
-    const v=Math.round(((d[i]-mn)/range)*255);
-    d[i]=d[i+1]=d[i+2]=v;
-  }
-  // 3) Adaptive threshold (Otsu-like binarization)
-  const hist=new Array(256).fill(0);
-  for(let i=0;i<d.length;i+=4) hist[d[i]]++;
-  const total=w*h;
-  let sum=0; for(let i=0;i<256;i++) sum+=i*hist[i];
-  let sumB=0,wB=0,wF=0,maxVar=0,thresh=128;
-  for(let t=0;t<256;t++){
-    wB+=hist[t]; if(!wB) continue;
-    wF=total-wB; if(!wF) break;
-    sumB+=t*hist[t];
-    const mB=sumB/wB, mF=(sum-sumB)/wF;
-    const v=wB*wF*(mB-mF)*(mB-mF);
-    if(v>maxVar){maxVar=v;thresh=t;}
-  }
-  // 4) Apply threshold + sharpen: make text black on white
-  for(let i=0;i<d.length;i+=4){
-    const v=d[i]>thresh?255:0;
-    d[i]=d[i+1]=d[i+2]=v;
-  }
-  ctx.putImageData(imgData,0,0);
-  return proc;
+const OCR_FIELDS = [
+  { id:'alt',  label:'Estatura (cm)',       rowIndex:1,  min:40, max:250, keywords:['estatura','altura','est','alt','statura'] },
+  { id:'peso', label:'Peso Atual (kg)',     rowIndex:2,  min:1,  max:400, keywords:['peso atual','peso','kg'] },
+  { id:'cc',   label:'Circ. Cintura (cm)',  rowIndex:4,  min:20, max:250, keywords:['circ cintura','circ. cintura','cintura','cc'] },
+  { id:'cb',   label:'CB (cm)',             rowIndex:5,  min:10, max:80,  keywords:['circunferencia do braco','circunferencia do braço','braco','braço','cb'] },
+  { id:'dct',  label:'DCT (mm)',            rowIndex:8,  min:1,  max:80,  keywords:['dct','tricipital','tricip'] },
+  { id:'dcb',  label:'DCB (mm)',            rowIndex:9,  min:1,  max:80,  keywords:['dcb','bicipital','bicip'] },
+  { id:'dcse', label:'DCSE (mm)',           rowIndex:10, min:1,  max:80,  keywords:['dcse','subescapular','subescap'] },
+  { id:'dcsi', label:'DCSI (mm)',           rowIndex:11, min:1,  max:80,  keywords:['dcsi','suprailiaca','suprailíaca','supra'] },
+];
+
+function clamp(value,min,max){
+  return Math.max(min, Math.min(max, value));
 }
 
-// Load image from dataUrl into a canvas for preprocessing
+function median(values){
+  if(!values.length) return 0;
+  const sorted=[...values].sort((a,b)=>a-b);
+  const middle=Math.floor(sorted.length/2);
+  return sorted.length%2 ? sorted[middle] : (sorted[middle-1]+sorted[middle])/2;
+}
+
+function normalizeOCRText(text=''){
+  return String(text)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g,'');
+}
+
+function escapeHtml(text=''){
+  return String(text).replace(/[&<>"']/g, char => ({
+    '&':'&amp;',
+    '<':'&lt;',
+    '>':'&gt;',
+    '"':'&quot;',
+    "'":'&#39;'
+  }[char]));
+}
+
+function sanitizeOCRNumberText(text=''){
+  return normalizeOCRText(text)
+    .replace(/[oq]/g,'0')
+    .replace(/[i!l|]/g,'1')
+    .replace(/z/g,'2')
+    .replace(/s/g,'5')
+    .replace(/b/g,'8')
+    .replace(/[^0-9,\.\s]/g,' ')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+
+function normalizeCandidateValue(value, field){
+  let cleaned=String(value||'').trim().replace(/\s+/g,'').replace(/,/g,'.');
+  if(!cleaned) return '';
+
+  if((cleaned.match(/\./g)||[]).length>1){
+    const parts=cleaned.split('.');
+    cleaned=parts.slice(0,-1).join('') + '.' + parts[parts.length-1];
+  }
+
+  let num=parseFloat(cleaned);
+  if(!isFinite(num)) return '';
+
+  if(field.id==='alt' && num>0 && num<3){
+    num*=100;
+  }
+
+  num=Math.round(num*100)/100;
+  return String(num);
+}
+
+function extractNumericCandidates(text, field){
+  const cleaned=sanitizeOCRNumberText(text);
+  const candidates=new Set();
+  const direct=cleaned.match(/\d+(?:[.,]\d+)?/g)||[];
+  direct.forEach(value=>candidates.add(value));
+
+  const chunks=cleaned.split(/\s+/).filter(Boolean);
+  for(let i=0;i<chunks.length-1;i++){
+    const a=chunks[i], b=chunks[i+1];
+    if(/^\d+$/.test(a) && /^\d+$/.test(b)){
+      if(b.length<=2) candidates.add(`${a}.${b}`);
+      if(a.length<=2 && b.length<=3) candidates.add(`${a}${b}`);
+    }
+  }
+
+  for(let i=0;i<chunks.length-2;i++){
+    const a=chunks[i], b=chunks[i+1], c=chunks[i+2];
+    if(/^\d+$/.test(a) && /^\d+$/.test(b) && /^\d+$/.test(c)){
+      if((a+b+c).length<=4) candidates.add(`${a}${b}${c}`);
+      if(c.length<=2) candidates.add(`${a}${b}.${c}`);
+    }
+  }
+
+  return Array.from(candidates)
+    .map(value=>normalizeCandidateValue(value, field))
+    .filter(Boolean);
+}
+
+function scoreCandidateValue(value, field){
+  const num=parseFloat(String(value).replace(',','.'));
+  if(!isFinite(num)) return -999;
+
+  let score=0;
+  if(num>=field.min && num<=field.max){
+    score+=60;
+  }else{
+    const distance = num < field.min ? field.min - num : num - field.max;
+    score-=Math.min(60, distance*2);
+  }
+
+  if(String(value).includes('.')) score+=3;
+  if(field.id==='alt' && num>=100 && num<=220) score+=6;
+  if(field.id==='peso' && num>=30 && num<=200) score+=4;
+  if((field.id==='cc' || field.id==='cb') && num>=20 && num<=120) score+=4;
+  if(field.id.startsWith('dc') && num>=2 && num<=50) score+=5;
+  return score;
+}
+
+function pickBestNumericValue(text, field){
+  const candidates=extractNumericCandidates(text, field);
+  let best=null;
+  candidates.forEach(value=>{
+    const score=scoreCandidateValue(value, field);
+    if(!best || score>best.score) best={ value, score };
+  });
+  return best;
+}
+
+function computeOtsuThreshold(data){
+  const histogram=new Array(256).fill(0);
+  for(let i=0;i<data.length;i+=4) histogram[data[i]]++;
+
+  const total=data.length/4;
+  let sum=0;
+  for(let i=0;i<256;i++) sum+=i*histogram[i];
+
+  let sumB=0, weightB=0, maxVariance=0, threshold=128;
+  for(let t=0;t<256;t++){
+    weightB+=histogram[t];
+    if(!weightB) continue;
+
+    const weightF=total-weightB;
+    if(!weightF) break;
+
+    sumB+=t*histogram[t];
+    const meanB=sumB/weightB;
+    const meanF=(sum-sumB)/weightF;
+    const variance=weightB*weightF*(meanB-meanF)*(meanB-meanF);
+
+    if(variance>maxVariance){
+      maxVariance=variance;
+      threshold=t;
+    }
+  }
+
+  return threshold;
+}
+
+function preprocessImage(sourceCanvas, options={}){
+  const { contrast=1.8, binary=false, thresholdBias=0, thicken=false } = options;
+  const width=sourceCanvas.width;
+  const height=sourceCanvas.height;
+  const canvas=document.createElement('canvas');
+  canvas.width=width;
+  canvas.height=height;
+
+  const ctx=canvas.getContext('2d');
+  ctx.drawImage(sourceCanvas,0,0,width,height);
+  const imageData=ctx.getImageData(0,0,width,height);
+  const data=imageData.data;
+
+  for(let i=0;i<data.length;i+=4){
+    const gray=0.299*data[i]+0.587*data[i+1]+0.114*data[i+2];
+    const contrasted=clamp(((gray-128)*contrast)+128,0,255);
+    data[i]=data[i+1]=data[i+2]=contrasted;
+  }
+
+  if(binary){
+    const threshold=clamp(computeOtsuThreshold(data)+thresholdBias,35,220);
+    for(let i=0;i<data.length;i+=4){
+      const value=data[i]>threshold ? 255 : 0;
+      data[i]=data[i+1]=data[i+2]=value;
+    }
+
+    if(thicken){
+      const source=new Uint8ClampedArray(data);
+      for(let y=1;y<height-1;y++){
+        for(let x=1;x<width-1;x++){
+          const index=(y*width+x)*4;
+          if(source[index]===0) continue;
+
+          let darkNeighbors=0;
+          for(let dy=-1;dy<=1;dy++){
+            for(let dx=-1;dx<=1;dx++){
+              const neighbor=((y+dy)*width+(x+dx))*4;
+              if(source[neighbor]===0) darkNeighbors++;
+            }
+          }
+
+          if(darkNeighbors>=2){
+            data[index]=data[index+1]=data[index+2]=0;
+          }
+        }
+      }
+    }
+  }
+
+  ctx.putImageData(imageData,0,0);
+  return canvas;
+}
+
 function loadImageToCanvas(dataUrl){
   return new Promise((resolve)=>{
     const img=new Image();
     img.onload=()=>{
-      const c=document.createElement('canvas');
-      // Upscale small images for better OCR (min 1500px wide)
-      const scale=Math.max(1, 1500/img.width);
-      c.width=Math.round(img.width*scale);
-      c.height=Math.round(img.height*scale);
-      const ctx=c.getContext('2d');
+      const canvas=document.createElement('canvas');
+      const scale=clamp(Math.max(1,2200/img.width),1,2.8);
+      canvas.width=Math.round(img.width*scale);
+      canvas.height=Math.round(img.height*scale);
+
+      const ctx=canvas.getContext('2d');
       ctx.imageSmoothingEnabled=true;
-      ctx.drawImage(img,0,0,c.width,c.height);
-      resolve(c);
+      ctx.imageSmoothingQuality='high';
+      ctx.drawImage(img,0,0,canvas.width,canvas.height);
+      resolve(canvas);
     };
     img.src=dataUrl;
   });
 }
 
+function cropCanvasRegion(sourceCanvas, box){
+  const x=clamp(Math.floor(box.x),0,Math.max(0,sourceCanvas.width-1));
+  const y=clamp(Math.floor(box.y),0,Math.max(0,sourceCanvas.height-1));
+  const width=clamp(Math.floor(box.width),1,sourceCanvas.width-x);
+  const height=clamp(Math.floor(box.height),1,sourceCanvas.height-y);
+
+  const canvas=document.createElement('canvas');
+  canvas.width=width;
+  canvas.height=height;
+  const ctx=canvas.getContext('2d');
+  ctx.drawImage(sourceCanvas,x,y,width,height,0,0,width,height);
+  return canvas;
+}
+
+function locateFieldRows(pageResult){
+  const rows={};
+  const lines=pageResult?.data?.lines || [];
+
+  for(const line of lines){
+    const text=line?.text || '';
+    const normalized=normalizeOCRText(text);
+    const bbox=line?.bbox;
+    if(!normalized || !bbox) continue;
+
+    for(const field of OCR_FIELDS){
+      const matched=field.keywords.some(keyword => normalized.includes(normalizeOCRText(keyword)));
+      if(!matched) continue;
+
+      const confidence=line.confidence || line.conf || 0;
+      if(!rows[field.id] || confidence >= rows[field.id].conf){
+        rows[field.id]={
+          fieldId: field.id,
+          bbox,
+          cy: (bbox.y0+bbox.y1)/2,
+          height: Math.max(1,bbox.y1-bbox.y0),
+          conf: confidence,
+          text,
+        };
+      }
+      break;
+    }
+  }
+
+  return rows;
+}
+
+function buildFieldWindows(sourceCanvas, rowMap){
+  const detectedRows=OCR_FIELDS
+    .map(field => rowMap[field.id] ? { ...rowMap[field.id], rowIndex: field.rowIndex } : null)
+    .filter(Boolean);
+
+  if(!detectedRows.length) return null;
+
+  const medianHeight=median(detectedRows.map(row=>row.height)) || Math.max(18,sourceCanvas.height/26);
+  let slope=0;
+  let intercept=0;
+
+  if(detectedRows.length>=2){
+    const n=detectedRows.length;
+    let sumX=0, sumY=0, sumXY=0, sumXX=0;
+    detectedRows.forEach(row=>{
+      sumX+=row.rowIndex;
+      sumY+=row.cy;
+      sumXY+=row.rowIndex*row.cy;
+      sumXX+=row.rowIndex*row.rowIndex;
+    });
+    const denominator=n*sumXX-sumX*sumX;
+    slope=denominator ? (n*sumXY-sumX*sumY)/denominator : 0;
+    intercept=n ? (sumY-slope*sumX)/n : 0;
+  }
+
+  if(!isFinite(slope) || slope < medianHeight*0.8){
+    slope=Math.max(medianHeight*1.85, sourceCanvas.height/18);
+  }
+
+  if(!isFinite(intercept) || intercept===0){
+    intercept=detectedRows[0].cy - slope*detectedRows[0].rowIndex;
+  }
+
+  const labelRightEdge=Math.max(...detectedRows.map(row=>row.bbox.x1));
+  const x=clamp(Math.max(labelRightEdge+18, sourceCanvas.width*0.46), 0, sourceCanvas.width-20);
+  const right=clamp(sourceCanvas.width-Math.round(sourceCanvas.width*0.03), x+20, sourceCanvas.width);
+  const cellHeight=Math.min(sourceCanvas.height, Math.max(slope*0.82, medianHeight*1.9));
+  const maxY=Math.max(0, sourceCanvas.height-cellHeight);
+
+  const windows={};
+  OCR_FIELDS.forEach(field=>{
+    const detected=rowMap[field.id];
+    const centerY=detected ? detected.cy : intercept + slope*field.rowIndex;
+    windows[field.id]={
+      x,
+      y: clamp(centerY-cellHeight/2, 0, maxY),
+      width: right-x,
+      height: cellHeight,
+    };
+  });
+
+  return windows;
+}
+
+function buildFallbackFieldWindows(sourceCanvas){
+  const x=Math.round(sourceCanvas.width*0.5);
+  const right=Math.round(sourceCanvas.width*0.97);
+  const rowHeight=sourceCanvas.height/16;
+  const topAnchor=sourceCanvas.height*0.12;
+  const windows={};
+
+  OCR_FIELDS.forEach(field=>{
+    const height=Math.max(22,rowHeight*0.92);
+    const centerY=topAnchor + field.rowIndex*rowHeight;
+    const maxY=Math.max(0,sourceCanvas.height-height);
+    windows[field.id]={
+      x,
+      y: clamp(centerY-height/2, 0, maxY),
+      width: right-x,
+      height,
+    };
+  });
+
+  return windows;
+}
+
+function buildCellVariants(cellCanvas){
+  return [
+    { name:'suave',  psm:7, canvas: preprocessImage(cellCanvas,{ contrast:2.05, binary:false, thresholdBias:0,   thicken:false }) },
+    { name:'lapis',  psm:8, canvas: preprocessImage(cellCanvas,{ contrast:2.55, binary:true,  thresholdBias:-42, thicken:true  }) },
+    { name:'caneta', psm:8, canvas: preprocessImage(cellCanvas,{ contrast:2.2,  binary:true,  thresholdBias:-24, thicken:false }) },
+  ];
+}
+
+async function recognizeFieldValue(field, sourceCanvas, box, index, total){
+  const cellCanvas=cropCanvasRegion(sourceCanvas, box);
+  const attempts=buildCellVariants(cellCanvas);
+  let best=null;
+
+  for(const attempt of attempts){
+    const result=await Tesseract.recognize(attempt.canvas.toDataURL('image/png'),'eng',{
+      tessedit_char_whitelist:'0123456789.,',
+      tessedit_pageseg_mode:attempt.psm,
+      logger:m=>{
+        if(m.status==='recognizing text'){
+          document.getElementById('ocr-status').textContent=`⏳ Lendo ${field.label} (${index+1}/${total}) — ${Math.round((m.progress||0)*100)}%`;
+        }
+      }
+    });
+
+    const rawText=result?.data?.text || '';
+    const picked=pickBestNumericValue(rawText, field);
+    if(picked && (!best || picked.score > best.score)){
+      best={ ...picked, rawText, mode: attempt.name };
+    }
+
+    if(best && best.score >= 55) break;
+  }
+
+  return best;
+}
+
 async function runOCR(dataUrl){
-  document.getElementById('ocr-status').innerHTML='⏳ Pré-processando imagem...';
-  const srcCanvas=await loadImageToCanvas(dataUrl);
-  const processed=preprocessImage(srcCanvas);
-  const processedUrl=processed.toDataURL('image/png');
-  document.getElementById('ocr-status').innerHTML='⏳ Reconhecendo texto...';
-  const result=await Tesseract.recognize(processedUrl,'por',{logger:m=>{
-    if(m.status==='recognizing text')
-      document.getElementById('ocr-status').textContent=`⏳ Reconhecendo... ${Math.round((m.progress||0)*100)}%`;
-  }});
-  return result.data.text;
+  const sourceCanvas=await loadImageToCanvas(dataUrl);
+  const labelCanvas=preprocessImage(sourceCanvas,{ contrast:2.05, binary:true, thresholdBias:-12, thicken:false });
+
+  document.getElementById('ocr-status').textContent='⏳ Localizando os campos da ficha...';
+  const pageResult=await Tesseract.recognize(labelCanvas.toDataURL('image/png'),'por',{
+    logger:m=>{
+      if(m.status==='recognizing text'){
+        document.getElementById('ocr-status').textContent=`⏳ Localizando os campos da ficha... ${Math.round((m.progress||0)*100)}%`;
+      }
+    }
+  });
+
+  const rowMap=locateFieldRows(pageResult);
+  const windows=buildFieldWindows(sourceCanvas,rowMap) || buildFallbackFieldWindows(sourceCanvas);
+  const detected={};
+  const debugByField={};
+
+  for(let i=0;i<OCR_FIELDS.length;i++){
+    const field=OCR_FIELDS[i];
+    const best=await recognizeFieldValue(field, sourceCanvas, windows[field.id], i, OCR_FIELDS.length);
+    debugByField[field.id]=best?.rawText || '';
+    if(best?.value) detected[field.id]=best.value;
+  }
+
+  return {
+    text: pageResult?.data?.text || '',
+    detected,
+    debug: {
+      matchedLabels: Object.keys(rowMap).length,
+      byField: debugByField,
+    }
+  };
 }
 
 async function captureAndOCR(){
@@ -3788,12 +4135,13 @@ async function captureAndOCR(){
   stopCamera();
   document.getElementById('ocr-retry-btn').style.display='inline-flex';
   try{
-    const text=await runOCR(dataUrl);
-    parseOCRResults(text);
+    const result=await runOCR(dataUrl);
+    parseOCRResults(result);
   }catch(e){
     document.getElementById('ocr-status').textContent='❌ Erro no OCR: '+e.message;
   }
 }
+
 function retryOCR(){
   document.getElementById('ocr-preview').style.display='none';
   document.getElementById('ocr-results').innerHTML='';
@@ -3820,8 +4168,8 @@ async function handleGalleryUpload(event){
     document.getElementById('ocr-capture-btn').style.display='none';
     document.getElementById('ocr-retry-btn').style.display='inline-flex';
     try{
-      const text=await runOCR(dataUrl);
-      parseOCRResults(text);
+      const result=await runOCR(dataUrl);
+      parseOCRResults(result);
     }catch(err){
       document.getElementById('ocr-status').textContent='❌ Erro no OCR: '+err.message;
     }
@@ -3830,90 +4178,69 @@ async function handleGalleryUpload(event){
   event.target.value='';
 }
 
-function parseOCRResults(text){
-  const fields=[
-    {id:'alt',  label:'Estatura (cm)',  keywords:['estatura','altura','est','alt','statura']},
-    {id:'peso', label:'Peso Atual (kg)',keywords:['peso','peso atual','kg']},
-    {id:'cc',   label:'Circ. Cintura (cm)',keywords:['cintura','circ. cintura','circ cintura','cc']},
-    {id:'cb',   label:'CB (cm)',        keywords:['cb','circunf','braço','braco']},
-    {id:'dct',  label:'DCT (mm)',       keywords:['dct','tricipital','tricip']},
-    {id:'dcb',  label:'DCB (mm)',       keywords:['dcb','bicipital','bicip']},
-    {id:'dcse', label:'DCSE (mm)',      keywords:['dcse','subescapular','subescap']},
-    {id:'dcsi', label:'DCSI (mm)',      keywords:['dcsi','suprailíaca','suprailiaca','supra']},
-  ];
+function parseOCRResults(payload){
+  const text = typeof payload === 'string' ? payload : (payload?.text || '');
+  const debug = typeof payload === 'object' ? (payload?.debug || {}) : {};
+  const fields = OCR_FIELDS;
+  const detected = typeof payload === 'object' ? { ...(payload?.detected || {}) } : {};
 
-  // Smart line-by-line parsing: find label + number pairs
-  const detected = {};
-  const lines = text.split(/\n/);
-  
-  for(const line of lines){
-    const lower = line.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-    // Skip calculated fields
-    if(/\b(imc|cmb|amb|soma|dobras|gordura|responsavel)\b/i.test(lower)) continue;
-    
-    for(const f of fields){
-      if(detected[f.id]) continue;
-      const match = f.keywords.some(k => {
-        const kn = k.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-        return lower.includes(kn);
-      });
-      if(match){
-        // Find number on same line or nearby
-        const nums = line.match(/\d+[.,]\d+|\d+/g);
-        if(nums && nums.length > 0){
-          // Pick the last number on the line (value column is usually after label)
-          detected[f.id] = nums[nums.length-1].replace(',','.');
-        }
+  if(Object.keys(detected).length < fields.length){
+    const lines=text.split(/\n/);
+
+    for(const line of lines){
+      const normalized=normalizeOCRText(line);
+      if(/\b(imc|cmb|amb|soma|dobras|gordura|responsavel)\b/.test(normalized)) continue;
+
+      for(const field of fields){
+        if(detected[field.id]) continue;
+        const matched=field.keywords.some(keyword => normalized.includes(normalizeOCRText(keyword)));
+        if(!matched) continue;
+        const picked=pickBestNumericValue(line, field);
+        if(picked?.value) detected[field.id]=picked.value;
+        break;
+      }
+    }
+
+    for(let i=0;i<lines.length-1;i++){
+      const current=normalizeOCRText(lines[i]);
+      const next=lines[i+1].trim();
+      for(const field of fields){
+        if(detected[field.id]) continue;
+        const matched=field.keywords.some(keyword => current.includes(normalizeOCRText(keyword)));
+        if(!matched) continue;
+        const picked=pickBestNumericValue(next, field);
+        if(picked?.value) detected[field.id]=picked.value;
         break;
       }
     }
   }
 
-  // Also try: if text is a table with values on separate lines after labels
-  // Look for consecutive lines where one is a label and next is just a number
-  for(let i=0; i<lines.length-1; i++){
-    const lower = lines[i].toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-    const nextLine = lines[i+1].trim();
-    const nextNums = nextLine.match(/^\d+[.,]?\d*$/);
-    if(!nextNums) continue;
-    
-    for(const f of fields){
-      if(detected[f.id]) continue;
-      const match = f.keywords.some(k => {
-        const kn = k.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-        return lower.includes(kn);
-      });
-      if(match){
-        detected[f.id] = nextNums[0].replace(',','.');
-        break;
-      }
-    }
-  }
-
-  // Build UI - always show ALL fields, pre-filled if detected
   let html='<p style="font-size:.75rem;font-weight:600;color:var(--text2);margin-bottom:8px">Valores detectados (edite se necessário e clique Aplicar Todos):</p>';
-  
-  const detectedCount = Object.keys(detected).length;
-  if(detectedCount === 0){
-    html+='<p style="font-size:.8rem;color:var(--warn-text);padding:12px;background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:10px;margin-bottom:10px">⚠️ Nenhum valor reconhecido automaticamente. Preencha manualmente abaixo:</p>';
-  } else {
-    html+=`<p style="font-size:.72rem;color:var(--accent-text);margin-bottom:8px">✅ ${detectedCount} campo(s) reconhecido(s). Confira e corrija se necessário.</p>`;
+  const detectedCount=Object.keys(detected).length;
+
+  if(detectedCount===0){
+    html+='<p style="font-size:.8rem;color:var(--warn-text);padding:12px;background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:10px;margin-bottom:10px">⚠️ Nenhum valor reconhecido automaticamente. Preencha manualmente abaixo.</p>';
+  }else{
+    html+=`<p style="font-size:.72rem;color:var(--accent-text);margin-bottom:8px">✅ ${detectedCount} de ${fields.length} campo(s) reconhecido(s). Confira antes de aplicar.</p>`;
   }
 
-  // Show raw OCR text for debugging
-  html+=`<details style="margin-bottom:10px"><summary style="font-size:.68rem;color:var(--text3);cursor:pointer">Ver texto bruto do OCR</summary><pre style="font-size:.65rem;color:var(--text3);background:var(--bg3);padding:8px;border-radius:8px;white-space:pre-wrap;max-height:120px;overflow-y:auto">${text}</pre></details>`;
+  if(debug.matchedLabels){
+    html+=`<p style="font-size:.68rem;color:var(--text3);margin-bottom:8px">Rótulos localizados na ficha: ${debug.matchedLabels}/${fields.length}</p>`;
+  }
 
-  fields.forEach((f,i)=>{
-    const val = detected[f.id] || '';
-    const highlight = val ? 'border-color:var(--accent);background:var(--accent-glow)' : '';
+  html+=`<details style="margin-bottom:10px"><summary style="font-size:.68rem;color:var(--text3);cursor:pointer">Ver texto bruto do OCR</summary><pre style="font-size:.65rem;color:var(--text3);background:var(--bg3);padding:8px;border-radius:8px;white-space:pre-wrap;max-height:120px;overflow-y:auto">${escapeHtml(text)}</pre></details>`;
+
+  fields.forEach((field,index)=>{
+    const value=detected[field.id] || '';
+    const highlight=value ? 'border-color:var(--accent);background:var(--accent-glow)' : '';
     html+=`<div class="ocr-result-item" style="${highlight}">
-      <label style="min-width:90px">${f.label}</label>
-      <input type="text" id="ocr-val-${i}" value="${val}" inputmode="decimal" placeholder="—" data-field="${f.id}">
-      <button onclick="applyOCRSingle(${i})">Aplicar</button>
+      <label style="min-width:90px">${field.label}</label>
+      <input type="text" id="ocr-val-${index}" value="${value}" inputmode="decimal" placeholder="—" data-field="${field.id}">
+      <button onclick="applyOCRSingle(${index})">Aplicar</button>
     </div>`;
   });
+
   html+=`<button class="ocr-btn ocr-btn-primary" style="margin-top:10px;width:100%" onclick="applyAllOCRSmart()">✅ Aplicar Todos</button>`;
-  
   document.getElementById('ocr-status').textContent='✅ OCR concluído. Revise os valores abaixo.';
   document.getElementById('ocr-results').innerHTML=html;
 }
@@ -3930,6 +4257,7 @@ function applyOCRSingle(idx){
   input.parentElement.style.borderColor='var(--corr-ok-bd)';
   input.parentElement.style.background='var(--corr-ok-bg)';
 }
+
 function applyAllOCRSmart(){
   const inputs=document.querySelectorAll('[id^="ocr-val-"]');
   inputs.forEach(input=>{
