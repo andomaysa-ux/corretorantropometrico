@@ -3641,21 +3641,20 @@ renderVideos();
 .ocr-close:hover{color:var(--text)}
 </style>
 
-<button class="ocr-fab" onclick="openOCR()" title="Capturar valores pela câmera">📷</button>
+<button class="ocr-fab" onclick="openOCR()" title="Capturar valores pela câmera ou galeria">📷</button>
+<input type="file" id="ocr-file-input" accept="image/*" style="display:none" onchange="handleGalleryUpload(event)">
 
 <div class="ocr-modal" id="ocr-modal">
   <div class="ocr-box" style="position:relative">
     <button class="ocr-close" onclick="closeOCR()">✕</button>
-    <h3>📷 Captura por Câmera (OCR)</h3>
-    <p style="font-size:.75rem;color:var(--text3);margin-bottom:12px;line-height:1.5">
-      Aponte a câmera para os valores escritos à mão. O sistema tentará reconhecer os números automaticamente.
-      Se não reconhecer corretamente, você pode editar os valores manualmente antes de aplicar.
-    </p>
+    <h3>📷 Leitura de Medidas (OCR)</h3>
+    <p style="font-size:.72rem;color:var(--text3);margin-bottom:10px">Tire uma foto ou envie da galeria. O sistema lê: Peso, Estatura, Circ. Cintura, CB, DCT, DCB, DCSE e DCSI.</p>
     <video class="ocr-video" id="ocr-video" autoplay playsinline></video>
     <canvas class="ocr-canvas" id="ocr-canvas"></canvas>
     <img class="ocr-preview" id="ocr-preview" alt="Preview">
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="ocr-btn ocr-btn-primary" id="ocr-start-btn" onclick="startCamera()">📷 Abrir Câmera</button>
+      <button class="ocr-btn ocr-btn-primary" id="ocr-gallery-btn" onclick="document.getElementById('ocr-file-input').click()">🖼️ Galeria</button>
       <button class="ocr-btn ocr-btn-primary" id="ocr-capture-btn" onclick="captureAndOCR()" style="display:none">📸 Capturar</button>
       <button class="ocr-btn ocr-btn-secondary" id="ocr-retry-btn" onclick="retryOCR()" style="display:none">🔄 Tentar novamente</button>
     </div>
@@ -3679,6 +3678,7 @@ function stopCamera(){
   document.getElementById('ocr-video').style.display='none';
   document.getElementById('ocr-capture-btn').style.display='none';
   document.getElementById('ocr-start-btn').style.display='inline-flex';
+  document.getElementById('ocr-gallery-btn').style.display='inline-flex';
 }
 async function startCamera(){
   try{
@@ -3687,6 +3687,7 @@ async function startCamera(){
     video.srcObject=ocrStream;
     video.style.display='block';
     document.getElementById('ocr-start-btn').style.display='none';
+    document.getElementById('ocr-gallery-btn').style.display='none';
     document.getElementById('ocr-capture-btn').style.display='inline-flex';
     document.getElementById('ocr-retry-btn').style.display='none';
     document.getElementById('ocr-preview').style.display='none';
@@ -3724,63 +3725,155 @@ async function captureAndOCR(){
 function retryOCR(){
   document.getElementById('ocr-preview').style.display='none';
   document.getElementById('ocr-results').innerHTML='';
-  startCamera();
+  document.getElementById('ocr-start-btn').style.display='inline-flex';
+  document.getElementById('ocr-gallery-btn').style.display='inline-flex';
+  document.getElementById('ocr-capture-btn').style.display='none';
+  document.getElementById('ocr-retry-btn').style.display='none';
+  document.getElementById('ocr-status').textContent='';
+}
+
+async function handleGalleryUpload(event){
+  const file=event.target.files[0];
+  if(!file) return;
+  const reader=new FileReader();
+  reader.onload=async function(e){
+    const dataUrl=e.target.result;
+    const preview=document.getElementById('ocr-preview');
+    preview.src=dataUrl;
+    preview.style.display='block';
+    document.getElementById('ocr-video').style.display='none';
+    if(ocrStream){ocrStream.getTracks().forEach(t=>t.stop());ocrStream=null;}
+    document.getElementById('ocr-start-btn').style.display='none';
+    document.getElementById('ocr-gallery-btn').style.display='none';
+    document.getElementById('ocr-capture-btn').style.display='none';
+    document.getElementById('ocr-retry-btn').style.display='inline-flex';
+    document.getElementById('ocr-status').innerHTML='⏳ Processando OCR... aguarde...';
+    try{
+      const result=await Tesseract.recognize(dataUrl,'por',{logger:m=>{
+        if(m.status==='recognizing text')
+          document.getElementById('ocr-status').textContent=`⏳ Reconhecendo... ${Math.round((m.progress||0)*100)}%`;
+      }});
+      const text=result.data.text;
+      parseOCRResults(text);
+    }catch(err){
+      document.getElementById('ocr-status').textContent='❌ Erro no OCR: '+err.message;
+    }
+  };
+  reader.readAsDataURL(file);
+  event.target.value='';
 }
 
 function parseOCRResults(text){
-  // Extract numbers from recognized text
-  const numbers=text.match(/\d+[.,]?\d*/g)||[];
-  const cleaned=numbers.map(n=>n.replace(',','.'));
-  
-  // Map of field IDs and labels
   const fields=[
-    {id:'peso',label:'Peso (kg)'},
-    {id:'alt',label:'Altura (cm)'},
-    {id:'age',label:'Idade (anos)'},
-    {id:'cb',label:'CB (cm)'},
-    {id:'dct',label:'DCT (mm)'},
-    {id:'dcb',label:'DCB (mm)'},
-    {id:'dcse',label:'DCSE (mm)'},
-    {id:'dcsi',label:'DCSI (mm)'},
-    {id:'cc',label:'CC (cm)'},
+    {id:'alt',  label:'Estatura (cm)',  keywords:['estatura','altura','est','alt','statura']},
+    {id:'peso', label:'Peso Atual (kg)',keywords:['peso','peso atual','kg']},
+    {id:'cc',   label:'Circ. Cintura (cm)',keywords:['cintura','circ. cintura','circ cintura','cc']},
+    {id:'cb',   label:'CB (cm)',        keywords:['cb','circunf','braço','braco']},
+    {id:'dct',  label:'DCT (mm)',       keywords:['dct','tricipital','tricip']},
+    {id:'dcb',  label:'DCB (mm)',       keywords:['dcb','bicipital','bicip']},
+    {id:'dcse', label:'DCSE (mm)',      keywords:['dcse','subescapular','subescap']},
+    {id:'dcsi', label:'DCSI (mm)',      keywords:['dcsi','suprailíaca','suprailiaca','supra']},
   ];
+
+  // Smart line-by-line parsing: find label + number pairs
+  const detected = {};
+  const lines = text.split(/\n/);
   
-  let html='<p style="font-size:.75rem;font-weight:600;color:var(--text2);margin-bottom:8px">Valores detectados (edite se necessário e clique Aplicar):</p>';
-  
-  if(cleaned.length===0){
-    html+='<p style="font-size:.8rem;color:var(--warn-text);padding:12px;background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:10px">Nenhum número detectado. Tente novamente com melhor iluminação ou preencha manualmente.</p>';
-  } else {
-    cleaned.forEach((val,i)=>{
-      const field=fields[i]||{id:'',label:`Valor ${i+1}`};
-      html+=`<div class="ocr-result-item">
-        <label>${field.label}</label>
-        <input type="text" id="ocr-val-${i}" value="${val}" inputmode="decimal">
-        <select id="ocr-field-${i}" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border);font-size:.72rem;background:var(--surface)">
-          <option value="">— Campo —</option>
-          ${fields.map(f=>`<option value="${f.id}" ${f===field?'selected':''}>${f.label}</option>`).join('')}
-        </select>
-        <button onclick="applyOCRValue(${i})">Aplicar</button>
-      </div>`;
-    });
-    html+=`<button class="ocr-btn ocr-btn-primary" style="margin-top:10px;width:100%" onclick="applyAllOCR(${cleaned.length})">✅ Aplicar Todos</button>`;
+  for(const line of lines){
+    const lower = line.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+    // Skip calculated fields
+    if(/\b(imc|cmb|amb|soma|dobras|gordura|responsavel)\b/i.test(lower)) continue;
+    
+    for(const f of fields){
+      if(detected[f.id]) continue;
+      const match = f.keywords.some(k => {
+        const kn = k.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+        return lower.includes(kn);
+      });
+      if(match){
+        // Find number on same line or nearby
+        const nums = line.match(/\d+[.,]\d+|\d+/g);
+        if(nums && nums.length > 0){
+          // Pick the last number on the line (value column is usually after label)
+          detected[f.id] = nums[nums.length-1].replace(',','.');
+        }
+        break;
+      }
+    }
   }
+
+  // Also try: if text is a table with values on separate lines after labels
+  // Look for consecutive lines where one is a label and next is just a number
+  for(let i=0; i<lines.length-1; i++){
+    const lower = lines[i].toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+    const nextLine = lines[i+1].trim();
+    const nextNums = nextLine.match(/^\d+[.,]?\d*$/);
+    if(!nextNums) continue;
+    
+    for(const f of fields){
+      if(detected[f.id]) continue;
+      const match = f.keywords.some(k => {
+        const kn = k.normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+        return lower.includes(kn);
+      });
+      if(match){
+        detected[f.id] = nextNums[0].replace(',','.');
+        break;
+      }
+    }
+  }
+
+  // Build UI - always show ALL fields, pre-filled if detected
+  let html='<p style="font-size:.75rem;font-weight:600;color:var(--text2);margin-bottom:8px">Valores detectados (edite se necessário e clique Aplicar Todos):</p>';
+  
+  const detectedCount = Object.keys(detected).length;
+  if(detectedCount === 0){
+    html+='<p style="font-size:.8rem;color:var(--warn-text);padding:12px;background:var(--warn-bg);border:1px solid var(--warn-border);border-radius:10px;margin-bottom:10px">⚠️ Nenhum valor reconhecido automaticamente. Preencha manualmente abaixo:</p>';
+  } else {
+    html+=`<p style="font-size:.72rem;color:var(--accent-text);margin-bottom:8px">✅ ${detectedCount} campo(s) reconhecido(s). Confira e corrija se necessário.</p>`;
+  }
+
+  // Show raw OCR text for debugging
+  html+=`<details style="margin-bottom:10px"><summary style="font-size:.68rem;color:var(--text3);cursor:pointer">Ver texto bruto do OCR</summary><pre style="font-size:.65rem;color:var(--text3);background:var(--bg3);padding:8px;border-radius:8px;white-space:pre-wrap;max-height:120px;overflow-y:auto">${text}</pre></details>`;
+
+  fields.forEach((f,i)=>{
+    const val = detected[f.id] || '';
+    const highlight = val ? 'border-color:var(--accent);background:var(--accent-glow)' : '';
+    html+=`<div class="ocr-result-item" style="${highlight}">
+      <label style="min-width:90px">${f.label}</label>
+      <input type="text" id="ocr-val-${i}" value="${val}" inputmode="decimal" placeholder="—" data-field="${f.id}">
+      <button onclick="applyOCRSingle(${i})">Aplicar</button>
+    </div>`;
+  });
+  html+=`<button class="ocr-btn ocr-btn-primary" style="margin-top:10px;width:100%" onclick="applyAllOCRSmart()">✅ Aplicar Todos</button>`;
   
   document.getElementById('ocr-status').textContent='✅ OCR concluído. Revise os valores abaixo.';
   document.getElementById('ocr-results').innerHTML=html;
 }
 
-function applyOCRValue(idx){
-  const val=document.getElementById('ocr-val-'+idx)?.value;
-  const fieldId=document.getElementById('ocr-field-'+idx)?.value;
+function applyOCRSingle(idx){
+  const input=document.getElementById('ocr-val-'+idx);
+  if(!input) return;
+  const val=input.value.trim().replace(',','.');
+  const fieldId=input.dataset.field;
   if(!fieldId||!val) return;
   const el=document.getElementById(fieldId);
-  if(el){el.value=val.replace(',','.');el.dispatchEvent(new Event('input',{bubbles:true}));}
+  if(el){el.value=val;el.dispatchEvent(new Event('input',{bubbles:true}));}
   recalc();
+  input.parentElement.style.borderColor='var(--corr-ok-bd)';
+  input.parentElement.style.background='var(--corr-ok-bg)';
 }
-function applyAllOCR(count){
-  for(let i=0;i<count;i++) applyOCRValue(i);
-  closeOCR();
+function applyAllOCRSmart(){
+  const inputs=document.querySelectorAll('[id^="ocr-val-"]');
+  inputs.forEach(input=>{
+    const val=input.value.trim().replace(',','.');
+    const fieldId=input.dataset.field;
+    if(!fieldId||!val) return;
+    const el=document.getElementById(fieldId);
+    if(el){el.value=val;el.dispatchEvent(new Event('input',{bubbles:true}));}
+  });
   recalc();
+  closeOCR();
 }
 </script>
 
