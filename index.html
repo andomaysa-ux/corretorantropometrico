@@ -3719,6 +3719,32 @@ function median(values){
   return sorted.length%2 ? sorted[middle] : (sorted[middle-1]+sorted[middle])/2;
 }
 
+function average(values){
+  if(!values.length) return 0;
+  return values.reduce((sum,value)=>sum+value,0)/values.length;
+}
+
+function groupDenseIndexes(indexes, maxGap=1){
+  if(!indexes.length) return [];
+  const groups=[];
+  let start=indexes[0];
+  let prev=indexes[0];
+
+  for(let i=1;i<indexes.length;i++){
+    const current=indexes[i];
+    if(current-prev<=maxGap){
+      prev=current;
+      continue;
+    }
+    groups.push([start,prev]);
+    start=current;
+    prev=current;
+  }
+
+  groups.push([start,prev]);
+  return groups;
+}
+
 function normalizeOCRText(text=''){
   return String(text)
     .toLowerCase()
@@ -3748,6 +3774,24 @@ function sanitizeOCRNumberText(text=''){
     .trim();
 }
 
+function expandCompactNumericToken(token, field){
+  const digits=String(token||'').replace(/\D/g,'');
+  if(!digits) return [];
+
+  const variants=new Set([digits]);
+  if(/^\d{3,4}$/.test(digits)){
+    if(field.id==='alt'){
+      if(digits.length===3) variants.add(`${digits[0]}.${digits.slice(1)}`);
+      if(digits.length===4) variants.add(`${digits.slice(0,3)}.${digits.slice(3)}`);
+    }else{
+      variants.add(`${digits.slice(0,-1)}.${digits.slice(-1)}`);
+      if(digits.length===4) variants.add(`${digits.slice(0,-2)}.${digits.slice(-2)}`);
+    }
+  }
+
+  return Array.from(variants);
+}
+
 function normalizeCandidateValue(value, field){
   let cleaned=String(value||'').trim().replace(/\s+/g,'').replace(/,/g,'.');
   if(!cleaned) return '';
@@ -3772,9 +3816,16 @@ function extractNumericCandidates(text, field){
   const cleaned=sanitizeOCRNumberText(text);
   const candidates=new Set();
   const direct=cleaned.match(/\d+(?:[.,]\d+)?/g)||[];
-  direct.forEach(value=>candidates.add(value));
+  direct.forEach(value=>{
+    candidates.add(value);
+    expandCompactNumericToken(value, field).forEach(item=>candidates.add(item));
+  });
 
   const chunks=cleaned.split(/\s+/).filter(Boolean);
+  chunks.forEach(chunk=>{
+    expandCompactNumericToken(chunk, field).forEach(item=>candidates.add(item));
+  });
+
   for(let i=0;i<chunks.length-1;i++){
     const a=chunks[i], b=chunks[i+1];
     if(/^\d+$/.test(a) && /^\d+$/.test(b)){
@@ -3909,6 +3960,110 @@ function preprocessImage(sourceCanvas, options={}){
   return canvas;
 }
 
+function buildDarkPixelProfiles(binaryCanvas){
+  const width=binaryCanvas.width;
+  const height=binaryCanvas.height;
+  const ctx=binaryCanvas.getContext('2d');
+  const data=ctx.getImageData(0,0,width,height).data;
+  const rowInk=new Array(height).fill(0);
+  const colInk=new Array(width).fill(0);
+
+  for(let y=0;y<height;y++){
+    for(let x=0;x<width;x++){
+      const index=(y*width+x)*4;
+      if(data[index]!==0) continue;
+      rowInk[y]++;
+      colInk[x]++;
+    }
+  }
+
+  return { rowInk, colInk };
+}
+
+function selectProminentGroups(groups, counts, minSpacing, maxCount){
+  return groups
+    .map(([start,end])=>({
+      start,
+      end,
+      center:(start+end)/2,
+      size:end-start+1,
+      strength:average(counts.slice(start,end+1)),
+    }))
+    .sort((a,b)=>b.strength-a.strength)
+    .reduce((selected,group)=>{
+      if(selected.length>=maxCount) return selected;
+      if(selected.some(item=>Math.abs(item.center-group.center)<minSpacing)) return selected;
+      selected.push(group);
+      return selected;
+    },[])
+    .sort((a,b)=>a.center-b.center);
+}
+
+function buildGridFieldWindows(sourceCanvas){
+  const gridCanvas=preprocessImage(sourceCanvas,{ contrast:2.6, binary:true, thresholdBias:-18, thicken:false });
+  const { rowInk, colInk } = buildDarkPixelProfiles(gridCanvas);
+
+  const rowIndexes=[];
+  const rowThreshold=Math.max(sourceCanvas.width*0.48, median(rowInk)*2.7);
+  for(let i=0;i<rowInk.length;i++){
+    if(rowInk[i]>=rowThreshold) rowIndexes.push(i);
+  }
+
+  const rowGroups=selectProminentGroups(
+    groupDenseIndexes(rowIndexes,1).filter(([start,end])=>end-start+1<=Math.max(8,Math.round(sourceCanvas.height*0.035))),
+    rowInk,
+    Math.max(10,Math.round(sourceCanvas.height*0.045)),
+    18
+  );
+
+  if(rowGroups.length<14) return null;
+
+  const colIndexes=[];
+  const colThreshold=Math.max(sourceCanvas.height*0.34, median(colInk)*3.1);
+  for(let i=0;i<colInk.length;i++){
+    if(colInk[i]>=colThreshold) colIndexes.push(i);
+  }
+
+  const colGroups=selectProminentGroups(
+    groupDenseIndexes(colIndexes,1).filter(([start,end])=>end-start+1<=Math.max(10,Math.round(sourceCanvas.width*0.08))),
+    colInk,
+    Math.max(12,Math.round(sourceCanvas.width*0.08)),
+    6
+  );
+
+  const divider=colGroups
+    .filter(group=>group.center>sourceCanvas.width*0.38 && group.center<sourceCanvas.width*0.78)
+    .sort((a,b)=>b.strength-a.strength || b.center-a.center)[0];
+
+  const dividerX=divider ? divider.end : Math.round(sourceCanvas.width*0.58);
+  const valueLeft=clamp(dividerX+Math.round(sourceCanvas.width*0.025),0,sourceCanvas.width-20);
+  const valueRight=clamp(Math.round(sourceCanvas.width*0.97),valueLeft+20,sourceCanvas.width);
+  const windows={};
+
+  OCR_FIELDS.forEach(field=>{
+    const topLine=rowGroups[field.rowIndex+1];
+    const bottomLine=rowGroups[field.rowIndex+2];
+    if(!topLine || !bottomLine) return;
+
+    const cellHeight=Math.max(12,bottomLine.center-topLine.center);
+    const insetY=Math.max(2,Math.round(cellHeight*0.08));
+    const y=clamp(topLine.center+insetY,0,sourceCanvas.height-10);
+    const bottom=clamp(bottomLine.center-insetY,y+10,sourceCanvas.height);
+    windows[field.id]={
+      x:valueLeft,
+      y,
+      width:valueRight-valueLeft,
+      height:bottom-y,
+    };
+  });
+
+  if(Object.keys(windows).length<6) return null;
+  return {
+    windows,
+    matchedLines:rowGroups.length,
+  };
+}
+
 function loadImageToCanvas(dataUrl){
   return new Promise((resolve)=>{
     const img=new Image();
@@ -3940,6 +4095,26 @@ function cropCanvasRegion(sourceCanvas, box){
   const ctx=canvas.getContext('2d');
   ctx.drawImage(sourceCanvas,x,y,width,height,0,0,width,height);
   return canvas;
+}
+
+function buildFieldFocusBoxes(box){
+  const full={ ...box };
+  const leftWide={
+    x:box.x,
+    y:box.y,
+    width:Math.max(18,Math.round(box.width*0.7)),
+    height:box.height,
+  };
+  const leftTight={
+    x:box.x+Math.round(box.width*0.03),
+    y:box.y,
+    width:Math.max(18,Math.round(box.width*0.56)),
+    height:box.height,
+  };
+
+  return [full,leftWide,leftTight].filter((candidate,index,array)=>
+    array.findIndex(item=>item.x===candidate.x && item.y===candidate.y && item.width===candidate.width && item.height===candidate.height)===index
+  );
 }
 
 function locateFieldRows(pageResult){
@@ -4052,35 +4227,44 @@ function buildFallbackFieldWindows(sourceCanvas){
 
 function buildCellVariants(cellCanvas){
   return [
-    { name:'suave',  psm:7, canvas: preprocessImage(cellCanvas,{ contrast:2.05, binary:false, thresholdBias:0,   thicken:false }) },
-    { name:'lapis',  psm:8, canvas: preprocessImage(cellCanvas,{ contrast:2.55, binary:true,  thresholdBias:-42, thicken:true  }) },
-    { name:'caneta', psm:8, canvas: preprocessImage(cellCanvas,{ contrast:2.2,  binary:true,  thresholdBias:-24, thicken:false }) },
+    { name:'suave',   psm:7,  canvas: preprocessImage(cellCanvas,{ contrast:2.2,  binary:false, thresholdBias:0,   thicken:false }) },
+    { name:'lapis',   psm:7,  canvas: preprocessImage(cellCanvas,{ contrast:2.75, binary:true,  thresholdBias:-36, thicken:true  }) },
+    { name:'caneta',  psm:13, canvas: preprocessImage(cellCanvas,{ contrast:2.35, binary:true,  thresholdBias:-18, thicken:false }) },
   ];
 }
 
 async function recognizeFieldValue(field, sourceCanvas, box, index, total){
-  const cellCanvas=cropCanvasRegion(sourceCanvas, box);
-  const attempts=buildCellVariants(cellCanvas);
   let best=null;
 
-  for(const attempt of attempts){
-    const result=await Tesseract.recognize(attempt.canvas.toDataURL('image/png'),'eng',{
-      tessedit_char_whitelist:'0123456789.,',
-      tessedit_pageseg_mode:attempt.psm,
-      logger:m=>{
-        if(m.status==='recognizing text'){
-          document.getElementById('ocr-status').textContent=`⏳ Lendo ${field.label} (${index+1}/${total}) — ${Math.round((m.progress||0)*100)}%`;
+  const focusBoxes=buildFieldFocusBoxes(box);
+  for(let focusIndex=0;focusIndex<focusBoxes.length;focusIndex++){
+    const cellCanvas=cropCanvasRegion(sourceCanvas, focusBoxes[focusIndex]);
+    const attempts=buildCellVariants(cellCanvas);
+
+    for(const attempt of attempts){
+      const result=await Tesseract.recognize(attempt.canvas.toDataURL('image/png'),'eng',{
+        tessedit_char_whitelist:'0123456789.,',
+        tessedit_pageseg_mode:attempt.psm,
+        logger:m=>{
+          if(m.status==='recognizing text'){
+            document.getElementById('ocr-status').textContent=`⏳ Lendo ${field.label} (${index+1}/${total}) — ${Math.round((m.progress||0)*100)}%`;
+          }
+        }
+      });
+
+      const rawText=result?.data?.text || '';
+      const picked=pickBestNumericValue(rawText, field);
+      if(picked){
+        const boostedScore=picked.score+(focusIndex===0 ? 0 : 4-focusIndex);
+        if(!best || boostedScore>best.score){
+          best={ ...picked, score:boostedScore, rawText, mode:`${attempt.name}-${focusIndex}` };
         }
       }
-    });
 
-    const rawText=result?.data?.text || '';
-    const picked=pickBestNumericValue(rawText, field);
-    if(picked && (!best || picked.score > best.score)){
-      best={ ...picked, rawText, mode: attempt.name };
+      if(best && best.score >= 58) break;
     }
 
-    if(best && best.score >= 55) break;
+    if(best && best.score >= 58) break;
   }
 
   return best;
@@ -4088,19 +4272,27 @@ async function recognizeFieldValue(field, sourceCanvas, box, index, total){
 
 async function runOCR(dataUrl){
   const sourceCanvas=await loadImageToCanvas(dataUrl);
-  const labelCanvas=preprocessImage(sourceCanvas,{ contrast:2.05, binary:true, thresholdBias:-12, thicken:false });
+  document.getElementById('ocr-status').textContent='⏳ Localizando a grade da ficha...';
+  const gridDetection=buildGridFieldWindows(sourceCanvas);
+  let pageResult=null;
+  let rowMap={};
+  let windows=gridDetection?.windows || null;
 
-  document.getElementById('ocr-status').textContent='⏳ Localizando os campos da ficha...';
-  const pageResult=await Tesseract.recognize(labelCanvas.toDataURL('image/png'),'por',{
-    logger:m=>{
-      if(m.status==='recognizing text'){
-        document.getElementById('ocr-status').textContent=`⏳ Localizando os campos da ficha... ${Math.round((m.progress||0)*100)}%`;
+  if(!windows){
+    const labelCanvas=preprocessImage(sourceCanvas,{ contrast:2.05, binary:true, thresholdBias:-12, thicken:false });
+    document.getElementById('ocr-status').textContent='⏳ Localizando os campos pelos rótulos...';
+    pageResult=await Tesseract.recognize(labelCanvas.toDataURL('image/png'),'por',{
+      logger:m=>{
+        if(m.status==='recognizing text'){
+          document.getElementById('ocr-status').textContent=`⏳ Localizando os campos pelos rótulos... ${Math.round((m.progress||0)*100)}%`;
+        }
       }
-    }
-  });
+    });
 
-  const rowMap=locateFieldRows(pageResult);
-  const windows=buildFieldWindows(sourceCanvas,rowMap) || buildFallbackFieldWindows(sourceCanvas);
+    rowMap=locateFieldRows(pageResult);
+    windows=buildFieldWindows(sourceCanvas,rowMap) || buildFallbackFieldWindows(sourceCanvas);
+  }
+
   const detected={};
   const debugByField={};
 
@@ -4115,6 +4307,7 @@ async function runOCR(dataUrl){
     text: pageResult?.data?.text || '',
     detected,
     debug: {
+      matchedGridLines:gridDetection?.matchedLines || 0,
       matchedLabels: Object.keys(rowMap).length,
       byField: debugByField,
     }
@@ -4226,6 +4419,10 @@ function parseOCRResults(payload){
 
   if(debug.matchedLabels){
     html+=`<p style="font-size:.68rem;color:var(--text3);margin-bottom:8px">Rótulos localizados na ficha: ${debug.matchedLabels}/${fields.length}</p>`;
+  }
+
+  if(debug.matchedGridLines){
+    html+=`<p style="font-size:.68rem;color:var(--text3);margin-bottom:8px">Linhas da grade detectadas: ${debug.matchedGridLines}</p>`;
   }
 
   html+=`<details style="margin-bottom:10px"><summary style="font-size:.68rem;color:var(--text3);cursor:pointer">Ver texto bruto do OCR</summary><pre style="font-size:.65rem;color:var(--text3);background:var(--bg3);padding:8px;border-radius:8px;white-space:pre-wrap;max-height:120px;overflow-y:auto">${escapeHtml(text)}</pre></details>`;
